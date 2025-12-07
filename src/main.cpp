@@ -40,7 +40,11 @@ class KeyInterceptor {
 
     std::vector<EKey> keys_to_ignore_this_update;
 
+    bool logging_enabled = false;
+
     void update() {
+        GlobalLogSection _("update", logging_enabled);
+
         linux_input_adapter.poll_events();
         // global_logger->debug("space just pressed: {}", input_state.is_just_pressed(EKey::SPACE));
 
@@ -167,6 +171,8 @@ class ChordSystem {
 
     bool possibly_going_into_mapping_mode = false;
 
+    bool logging_enabled = false;
+
     struct ChordMapping {
         EKey input_key;
         EKey output_key;
@@ -180,7 +186,7 @@ class ChordSystem {
 
     void per_iteration_logic() {
 
-        GlobalLogSection _("tick");
+        GlobalLogSection _("tick", logging_enabled);
 
         global_logger->debug("space signal state: {}",
                              input_state.key_enum_to_object.at(EKey::SPACE)->pressed_signal.to_string());
@@ -328,7 +334,7 @@ int main() {
     ChordSystem chord_system;
 
     auto term = []() { return false; };
-    ffl.logging_enabled = true;
+    ffl.logging_enabled = false;
 
     ffl.start([&](double dt) { chord_system.key_interceptor.update(); }, term);
 }
