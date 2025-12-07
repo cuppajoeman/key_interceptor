@@ -131,18 +131,31 @@ class ChordSystem {
 
   public:
     ChordSystem() : key_interceptor([this]() { per_iteration_logic(); }) {
-        add_chord_mapping(EKey::z, EKey::LEFT_SHIFT);
-        add_chord_mapping(EKey::x, EKey::LEFT_CONTROL);
-        // add_chord_mapping(EKey::c, EKey::LEFT_CONTROL); super
-        add_chord_mapping(EKey::v, EKey::LEFT_ALT);
+        // homesick
+
+        add_chord_mapping(EKey::q, EKey::TAB);
+        add_chord_mapping(EKey::w, EKey::GRAVE_ACCENT);
 
         add_chord_mapping(EKey::a, EKey::ESCAPE);
-        add_chord_mapping(EKey::q, EKey::TAB);
 
-        add_chord_mapping(EKey::p, EKey::BACKSPACE);
+        add_chord_mapping(EKey::z, EKey::LEFT_SHIFT);
+        add_chord_mapping(EKey::x, EKey::LEFT_CONTROL);
+        add_chord_mapping(EKey::c, EKey::LEFT_SUPER);
+        add_chord_mapping(EKey::v, EKey::LEFT_ALT);
+
+        add_chord_mapping(EKey::u, EKey::BACKSPACE);
+        add_chord_mapping(EKey::i, EKey::LEFT_SQUARE_BRACKET);
+        add_chord_mapping(EKey::o, EKey::RIGHT_SQUARE_BRACKET);
+        add_chord_mapping(EKey::p, EKey::BACKSLASH);
+
+        add_chord_mapping(EKey::l, EKey::SINGLE_QUOTE);
         add_chord_mapping(EKey::SEMICOLON, EKey::ENTER);
-        add_chord_mapping(EKey::SLASH, EKey::RIGHT_SHIFT);
+
+        // add_chord_mapping(EKey::n, EKey::FUNCTION_KEY);
+        add_chord_mapping(EKey::m, EKey::MENU_KEY);
+        add_chord_mapping(EKey::COMMA, EKey::RIGHT_ALT);
         add_chord_mapping(EKey::PERIOD, EKey::RIGHT_CONTROL);
+        add_chord_mapping(EKey::SLASH, EKey::RIGHT_SHIFT);
     }
 
     KeyInterceptor key_interceptor;
@@ -242,6 +255,9 @@ class ChordSystem {
                 // release all other keys
                 cm.active = false;
 
+                global_logger->info("about to turn off key: {}",
+                                    input_state.key_enum_to_object.at(cm.input_key)->string_repr);
+
                 send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(cm.output_key),
                          LinuxInputAdapter::release_value);
             }
@@ -293,6 +309,9 @@ class ChordSystem {
                 break;
             }
 
+            global_logger->info("about to turn on key: {}",
+                                input_state.key_enum_to_object.at(cm.input_key)->string_repr);
+
             key_interceptor.keys_to_ignore_this_update.push_back(cm.input_key);
             send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(cm.output_key), value);
             // transform_input_key_to_output_key(cm.input_key, cm.output_key);
@@ -302,7 +321,7 @@ class ChordSystem {
 
 int main() {
 
-    global_logger->remove_all_sinks();
+    // global_logger->remove_all_sinks();
     // global_logger->add_file_sink("logs/logs.txt");
 
     FixedFrequencyLoop ffl;

@@ -103,7 +103,8 @@ LinuxInputAdapter::LinuxInputAdapter(InputState &input_state, const std::string 
     linux_code_to_key_enum.emplace(KEY_RIGHTCTRL, EKey::RIGHT_CONTROL);
     linux_code_to_key_enum.emplace(KEY_LEFTALT, EKey::LEFT_ALT);
     linux_code_to_key_enum.emplace(KEY_RIGHTALT, EKey::RIGHT_ALT);
-    // SUPER KEYS?
+    linux_code_to_key_enum.emplace(KEY_LEFTMETA, EKey::LEFT_SUPER);
+    linux_code_to_key_enum.emplace(KEY_RIGHTMETA, EKey::RIGHT_SUPER);
 
     // Mouse buttons
     linux_code_to_key_enum.emplace(BTN_LEFT, EKey::LEFT_MOUSE_BUTTON);
