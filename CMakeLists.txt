@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.10) 
 project(key_interceptor)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -12,4 +12,5 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 find_package(spdlog)
 find_package(fmt)
-target_link_libraries(${PROJECT_NAME} spdlog::spdlog fmt::fmt)
+find_package(glm)
+target_link_libraries(${PROJECT_NAME} spdlog::spdlog fmt::fmt glm::glm)

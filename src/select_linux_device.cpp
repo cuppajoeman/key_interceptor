@@ -1,5 +1,7 @@
 #include "select_linux_device.hpp"
 #include <stdexcept>
+#include <thread>
+#include <chrono>
 
 // Helper to read "device name" from /sys
 std::string get_device_name(const std::string &event_path) {
@@ -110,6 +112,11 @@ std::string interactively_select_linux_device_name() {
 
     std::string selected_device = devices[selected_index];
     std::cout << "Using device: " << selected_device << "\n";
+
+    // New message + delay
+    std::cout << "Please release all keys... continuing in 1 second.\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
     return selected_device;
 }
 

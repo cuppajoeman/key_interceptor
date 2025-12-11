@@ -1,6 +1,7 @@
 [requires]
-fmt/11.2.0
-spdlog/1.15.3
+fmt/12.0.0
+spdlog/1.16.0
+glm/1.0.1
 
 [generators]
 CMakeDeps
