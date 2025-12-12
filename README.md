@@ -18,3 +18,6 @@ what if pressing space quickly after the mapping key enables it, so the map key 
 THere should be a dropout mode, where if you need to type something like 123
 
 There should also be a stacked mapping mode, so you can enable homesick, and then enable a different mapping which will clobber keys in the current mapping but leave the other keys still active, and then pop that mapping off to get back to homsick and vise versa.
+
+
+pressing shift is an interesting thought because in its own way it simply just remaps keys to other keys on the keyboard, in order to be able to press shift and any key simulateously we know that we can use the opposite hand to press the key, this is an important concept we need to use for ourselves you can create your own modifier keys as long as it exists symetrically on either side of the keyboard.
