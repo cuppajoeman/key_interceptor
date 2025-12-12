@@ -9,3 +9,10 @@ As of right now it only works on linux.
 ## homesick
 
 ![homesick mapping](assets/homesick_mapping.webp)
+
+## todo
+
+
+what if pressing space quickly after the mapping key enables it, so the map key for homesick is space in regular mode, and the second space activates it. If we carry that logic into homsick mapping and f is the mapping key for the numbers to come down, then we'd have to press space quickly after the mapping to enable it so space space f space would enable it. In order to do this we could add extra "virtual keys" which are not real keys, but act like them so then when the number mapping key is pressed and we let go of space it's still held down and then when space is pressed again it will then activate 
+
+THere should be a dropout mode, where if you need to type something like 123
