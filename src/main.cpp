@@ -1,17 +1,18 @@
 #include "input/linux_input_adapter/linux_input_adapter.hpp"
 
-#include "utility/fixed_frequency_loop/fixed_frequency_loop.hpp"
-
 #include "select_linux_device.hpp"
 
-#include "utility/collection_utils/collection_utils.hpp"
-#include "utility/logger/logger.hpp"
 #include "utility/temporal_binary_switch/temporal_binary_switch.hpp"
+#include "utility/fixed_frequency_loop/fixed_frequency_loop.hpp"
+#include "utility/collection_utils/collection_utils.hpp"
+#include "utility/text_utils/text_utils.hpp"
+#include "utility/logger/logger.hpp"
 #include "utility/timer/timer.hpp"
 
 #include <iostream>
 
 InputState input_state;
+InputState virtual_input_state;
 
 /**
  * @brief a class that process keys from the operating system and optionally forwards them to a virtul keyboard device,
@@ -23,7 +24,8 @@ class KeyInterceptor {
     std::function<void()> logic;
 
     KeyInterceptor(std::function<void()> logic)
-        : device_name(interactively_select_linux_device_name()), ufd(create_virtual_keyboard_device()),
+        : device_name(interactively_select_linux_device_name()),
+          virtual_keyboard_file_descriptor(create_virtual_keyboard_device()),
           linux_input_adapter(input_state, device_name, true), logic(logic) {
         key_enum_to_linux_code = collection_utils::invert(linux_input_adapter.linux_code_to_key_enum);
 
@@ -33,7 +35,7 @@ class KeyInterceptor {
     }
 
     std::string device_name;
-    int ufd;
+    int virtual_keyboard_file_descriptor;
     LinuxInputAdapter linux_input_adapter;
 
     std::unordered_map<EKey, int> key_enum_to_linux_code;
@@ -41,6 +43,14 @@ class KeyInterceptor {
     std::vector<EKey> keys_to_ignore_this_update;
 
     bool logging_enabled = false;
+
+    // will make the key occur on the virtual keyboard and also go through the virtual input state for analysis
+    void send_key_to_virtual_keyboard(EKey key_enum, int press_value) {
+        send_key(virtual_keyboard_file_descriptor, key_enum_to_linux_code.at(key_enum), press_value);
+
+        Key &active_key = *(virtual_input_state.key_enum_to_object.at(key_enum));
+        active_key.pressed_signal.set(press_value > 0);
+    }
 
     void update() {
         GlobalLogSection _("update", logging_enabled);
@@ -57,28 +67,29 @@ class KeyInterceptor {
             bool key_should_be_ignored = collection_utils::contains(keys_to_ignore_this_update, key_enum);
             if (key_should_be_ignored)
                 continue;
-            std::cout << "key press: " << input_state.key_enum_to_object.at(key_enum)->string_repr << std::endl;
-            send_key(ufd, key_enum_to_linux_code.at(key_enum), LinuxInputAdapter::press_value);
+
+            send_key_to_virtual_keyboard(key_enum, LinuxInputAdapter::press_value);
         }
 
         for (const auto &key_enum : input_state.get_held_keys()) {
             bool key_should_be_ignored = collection_utils::contains(keys_to_ignore_this_update, key_enum);
             if (key_should_be_ignored)
                 continue;
-            std::cout << "key repeat: " << input_state.key_enum_to_object.at(key_enum)->string_repr << std::endl;
-            send_key(ufd, key_enum_to_linux_code.at(key_enum), LinuxInputAdapter::repeat_value);
+
+            send_key_to_virtual_keyboard(key_enum, LinuxInputAdapter::repeat_value);
         }
 
         for (const auto &key_enum : input_state.get_just_released_keys()) {
             bool key_should_be_ignored = collection_utils::contains(keys_to_ignore_this_update, key_enum);
             if (key_should_be_ignored)
                 continue;
-            std::cout << "key release: " << input_state.key_enum_to_object.at(key_enum)->string_repr << std::endl;
-            send_key(ufd, key_enum_to_linux_code.at(key_enum), LinuxInputAdapter::release_value);
+
+            send_key_to_virtual_keyboard(key_enum, LinuxInputAdapter::release_value);
         }
 
         keys_to_ignore_this_update.clear();
         input_state.process();
+        virtual_input_state.process();
     }
 };
 
@@ -129,37 +140,122 @@ class KeyInterceptor {
  * need to be able to conditionally keep mapped keys active, and to do this we use above method. In this way we can
  * activate the mapping mode, and then hold down / to keep shift active
  *
+ * TODO: another feature that I want to add is the ability to do punch through toggling, what this means is that you hit
+ * space space to enter the mode, and while this is active there should be a way to temporarliy just toggle the mode so
+ * maybe akey where you press it down nd it will temporarily disable the mapping mode.
+ *
+ * the point is that you can type things like this_thing_here, without having to spam space so much
+ *
  */
 // TODO: this needs to be renamed, and then the one with these specific mappings is the homebody keyboard mappings
 class ChordSystem {
 
   public:
+    struct SingleKeyMap {
+        EKey input_key;
+        EKey output_key;
+        bool active = false;
+        TemporalBinarySwitch active_tbs;
+    };
+
+    enum class MapName {
+        homesick,
+        number_pulldown,
+        programming,
+    };
+
+    struct KeyMap {
+        MapName map_name;
+        std::vector<SingleKeyMap> key_mappings;
+
+        void add_key_mapping(EKey input_key, EKey output_key) { key_mappings.emplace_back(input_key, output_key); }
+    };
+
+    KeyMap key_map;
+
+    std::unordered_map<MapName, KeyMap> map_name_to_key_map = {
+        {MapName::homesick, KeyMap()},
+        {MapName::number_pulldown, KeyMap()},
+        {MapName::programming, KeyMap()},
+    };
+
+    void add_chord_mapping(EKey input_key, EKey output_key) {
+        key_map.key_mappings.emplace_back(input_key, output_key);
+    }
+
     ChordSystem() : key_interceptor([this]() { per_iteration_logic(); }) {
         // homesick
 
-        add_chord_mapping(EKey::q, EKey::TAB);
-        add_chord_mapping(EKey::w, EKey::GRAVE_ACCENT);
+        auto &homesick_mapping = map_name_to_key_map.at(MapName::homesick);
 
-        add_chord_mapping(EKey::a, EKey::ESCAPE);
+        homesick_mapping.add_key_mapping(EKey::q, EKey::TAB);
+        homesick_mapping.add_key_mapping(EKey::w, EKey::GRAVE_ACCENT);
 
-        add_chord_mapping(EKey::z, EKey::LEFT_SHIFT);
-        add_chord_mapping(EKey::x, EKey::LEFT_CONTROL);
-        add_chord_mapping(EKey::c, EKey::LEFT_SUPER);
-        add_chord_mapping(EKey::v, EKey::LEFT_ALT);
+        homesick_mapping.add_key_mapping(EKey::a, EKey::ESCAPE);
 
-        add_chord_mapping(EKey::u, EKey::BACKSPACE);
-        add_chord_mapping(EKey::i, EKey::LEFT_SQUARE_BRACKET);
-        add_chord_mapping(EKey::o, EKey::RIGHT_SQUARE_BRACKET);
-        add_chord_mapping(EKey::p, EKey::BACKSLASH);
+        homesick_mapping.add_key_mapping(EKey::z, EKey::LEFT_SHIFT);
+        homesick_mapping.add_key_mapping(EKey::x, EKey::LEFT_CONTROL);
+        homesick_mapping.add_key_mapping(EKey::c, EKey::LEFT_SUPER);
+        homesick_mapping.add_key_mapping(EKey::v, EKey::LEFT_ALT);
 
-        add_chord_mapping(EKey::l, EKey::SINGLE_QUOTE);
-        add_chord_mapping(EKey::SEMICOLON, EKey::ENTER);
+        homesick_mapping.add_key_mapping(EKey::u, EKey::BACKSPACE);
+        homesick_mapping.add_key_mapping(EKey::i, EKey::LEFT_SQUARE_BRACKET);
+        homesick_mapping.add_key_mapping(EKey::o, EKey::RIGHT_SQUARE_BRACKET);
+        homesick_mapping.add_key_mapping(EKey::p, EKey::BACKSLASH);
+
+        homesick_mapping.add_key_mapping(EKey::l, EKey::SINGLE_QUOTE);
+        homesick_mapping.add_key_mapping(EKey::SEMICOLON, EKey::ENTER);
 
         // add_chord_mapping(EKey::n, EKey::FUNCTION_KEY);
-        add_chord_mapping(EKey::m, EKey::MENU_KEY);
-        add_chord_mapping(EKey::COMMA, EKey::RIGHT_ALT);
-        add_chord_mapping(EKey::PERIOD, EKey::RIGHT_CONTROL);
-        add_chord_mapping(EKey::SLASH, EKey::RIGHT_SHIFT);
+        homesick_mapping.add_key_mapping(EKey::m, EKey::MENU_KEY);
+        homesick_mapping.add_key_mapping(EKey::COMMA, EKey::RIGHT_ALT);
+        homesick_mapping.add_key_mapping(EKey::PERIOD, EKey::RIGHT_CONTROL);
+        homesick_mapping.add_key_mapping(EKey::SLASH, EKey::RIGHT_SHIFT);
+
+        auto &number_pulldown_mapping = map_name_to_key_map.at(MapName::number_pulldown);
+        number_pulldown_mapping.add_key_mapping(EKey::a, EKey::ONE);
+        number_pulldown_mapping.add_key_mapping(EKey::s, EKey::TWO);
+        number_pulldown_mapping.add_key_mapping(EKey::d, EKey::THREE);
+        number_pulldown_mapping.add_key_mapping(EKey::f, EKey::FOUR);
+        number_pulldown_mapping.add_key_mapping(EKey::g, EKey::FIVE);
+        number_pulldown_mapping.add_key_mapping(EKey::h, EKey::SIX);
+        number_pulldown_mapping.add_key_mapping(EKey::j, EKey::SEVEN);
+        number_pulldown_mapping.add_key_mapping(EKey::k, EKey::EIGHT);
+        number_pulldown_mapping.add_key_mapping(EKey::l, EKey::NINE);
+        number_pulldown_mapping.add_key_mapping(EKey::SEMICOLON, EKey::ZERO);
+
+        number_pulldown_mapping.add_key_mapping(EKey::q, EKey::EXCLAMATION_POINT);
+        number_pulldown_mapping.add_key_mapping(EKey::w, EKey::AT_SIGN);
+        number_pulldown_mapping.add_key_mapping(EKey::e, EKey::NUMBER_SIGN);
+        number_pulldown_mapping.add_key_mapping(EKey::r, EKey::DOLLAR_SIGN);
+        number_pulldown_mapping.add_key_mapping(EKey::t, EKey::PERCENT_SIGN);
+        number_pulldown_mapping.add_key_mapping(EKey::y, EKey::CARET);
+        number_pulldown_mapping.add_key_mapping(EKey::u, EKey::AMPERSAND);
+        number_pulldown_mapping.add_key_mapping(EKey::i, EKey::ASTERISK);
+        number_pulldown_mapping.add_key_mapping(EKey::o, EKey::LEFT_PARENTHESIS);
+        number_pulldown_mapping.add_key_mapping(EKey::p, EKey::RIGHT_PARENTHESIS);
+
+        auto &programming_mapping = map_name_to_key_map.at(MapName::programming);
+
+        programming_mapping.add_key_mapping(EKey::f, EKey::LEFT_PARENTHESIS);  // (
+        programming_mapping.add_key_mapping(EKey::j, EKey::RIGHT_PARENTHESIS); // )
+
+        programming_mapping.add_key_mapping(EKey::d, EKey::LEFT_SQUARE_BRACKET);  // [
+        programming_mapping.add_key_mapping(EKey::k, EKey::RIGHT_SQUARE_BRACKET); // ]
+
+        programming_mapping.add_key_mapping(EKey::s, EKey::LESS_THAN);    // <
+        programming_mapping.add_key_mapping(EKey::l, EKey::GREATER_THAN); // >
+
+        programming_mapping.add_key_mapping(EKey::a, EKey::LEFT_CURLY_BRACKET);          // {
+        programming_mapping.add_key_mapping(EKey::SEMICOLON, EKey::RIGHT_CURLY_BRACKET); // }
+        //
+        programming_mapping.add_key_mapping(EKey::w, EKey::MINUS); // i think of this as a dash
+        programming_mapping.add_key_mapping(EKey::e, EKey::EQUAL);
+
+        programming_mapping.add_key_mapping(EKey::i, EKey::ASTERISK);
+        programming_mapping.add_key_mapping(EKey::o, EKey::AMPERSAND);
+
+        programming_mapping.add_key_mapping(EKey::x, EKey::COLON);
     }
 
     KeyInterceptor key_interceptor;
@@ -172,17 +268,6 @@ class ChordSystem {
     bool possibly_going_into_mapping_mode = false;
 
     bool logging_enabled = false;
-
-    struct ChordMapping {
-        EKey input_key;
-        EKey output_key;
-        bool active = false;
-        TemporalBinarySwitch active_tbs;
-    };
-
-    std::vector<ChordMapping> chord_mappings;
-
-    void add_chord_mapping(EKey input_key, EKey output_key) { chord_mappings.emplace_back(input_key, output_key); }
 
     void per_iteration_logic() {
 
@@ -208,10 +293,8 @@ class ChordSystem {
         // only if the time for the chord to start elapsed and you had pressed space we do a slightly delayed space
         // emission
         if (not mapping_mode_active and mapping_mode_activation_timer.time_up() and possibly_going_into_mapping_mode) {
-            send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(EKey::SPACE),
-                     LinuxInputAdapter::press_value);
-            send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(EKey::SPACE),
-                     LinuxInputAdapter::release_value);
+            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
+            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
             // you took too long so we're longer trying to
             possibly_going_into_mapping_mode = false;
         }
@@ -220,52 +303,24 @@ class ChordSystem {
         // because it cannot effect more than one iteration and chord keys come through on different iterations
         int num_consecutive_keys_to_modify = 1;
 
-        auto transform_input_key_to_output_key = [&](EKey input_key, EKey output_key) {
-            // NOTE: these if statements are mutually exclusive
-
-            if (num_consecutive_keys_to_modify == 0)
-                return;
-
-            if (input_state.is_just_pressed(input_key)) {
-                send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(output_key),
-                         LinuxInputAdapter::press_value);
-                possibly_going_into_mapping_mode = false;
-                num_consecutive_keys_to_modify--;
-            }
-            if (input_state.is_held(input_key)) {
-                send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(output_key),
-                         LinuxInputAdapter::repeat_value);
-
-                num_consecutive_keys_to_modify--;
-            }
-            // TODO: in the future we need to fix the problem where this is not reached because you released space
-            // before the chord key
-            if (input_state.is_just_released(input_key)) {
-                send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(output_key),
-                         LinuxInputAdapter::release_value);
-                num_consecutive_keys_to_modify--;
-            }
-            key_interceptor.keys_to_ignore_this_update.push_back(input_key);
-        };
-
         // chord ends here
         if (input_state.is_just_released(EKey::SPACE) and mapping_mode_active) {
             mapping_mode_active = false;
             // turn off all possible output keys from the chord mapping so they don't repeat if they were held down
             // when space was released.
-            for (auto &cm : chord_mappings) {
+            for (auto &km : map_name_to_key_map.at(MapName::homesick).key_mappings) {
+
                 // leave actively pressed keys on.
-                if (input_state.is_pressed(cm.input_key))
+                if (input_state.is_pressed(km.input_key))
                     continue;
 
                 // release all other keys
-                cm.active = false;
+                km.active = false;
 
                 global_logger->info("about to turn off key: {}",
-                                    input_state.key_enum_to_object.at(cm.input_key)->string_repr);
+                                    input_state.key_enum_to_object.at(km.input_key)->string_repr);
 
-                send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(cm.output_key),
-                         LinuxInputAdapter::release_value);
+                key_interceptor.send_key_to_virtual_keyboard(km.output_key, LinuxInputAdapter::release_value);
             }
         }
 
@@ -275,23 +330,21 @@ class ChordSystem {
         // when you type somethign like  "<space>a" we immediately emit the space key before this key so that you can
         // type at full speed.
         if (not mapping_mode_active and used_non_space_key and possibly_going_into_mapping_mode) {
-            send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(EKey::SPACE),
-                     LinuxInputAdapter::press_value);
-            send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(EKey::SPACE),
-                     LinuxInputAdapter::release_value);
+            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
+            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
             possibly_going_into_mapping_mode = false;
         }
 
         // TODO: generalize with more stuff later
         if (mapping_mode_active) {
-            for (auto &cm : chord_mappings) {
+            for (auto &cm : map_name_to_key_map.at(MapName::homesick).key_mappings) {
                 cm.active = true;
                 // transform_input_key_to_output_key(cm.input_key, cm.output_key);
             }
         }
 
         // this does the mappings
-        for (auto &cm : chord_mappings) {
+        for (auto &cm : map_name_to_key_map.at(MapName::homesick).key_mappings) {
 
             if (not cm.active)
                 continue;
@@ -319,15 +372,147 @@ class ChordSystem {
                                 input_state.key_enum_to_object.at(cm.input_key)->string_repr);
 
             key_interceptor.keys_to_ignore_this_update.push_back(cm.input_key);
-            send_key(key_interceptor.ufd, key_interceptor.key_enum_to_linux_code.at(cm.output_key), value);
+
+            key_interceptor.send_key_to_virtual_keyboard(cm.output_key, value);
             // transform_input_key_to_output_key(cm.input_key, cm.output_key);
         }
     }
 };
 
+class LinuxTerminalCanvas {
+  public:
+    LinuxTerminalCanvas() {
+        clear();
+        hide_cursor();
+    }
+
+    ~LinuxTerminalCanvas() {
+        clear();
+        show_cursor();
+        flush();
+    }
+
+    void clear() const { std::cout << "\033[2J\033[H"; }
+
+    // now takes x, y in Cartesian style
+    void move_cursor_xy(int x, int y) const { std::cout << "\033[" << y << ";" << x << "H"; }
+
+    void render_text_block(int x, int y, const std::string &text) const {
+        std::istringstream stream(text);
+        std::string line;
+        int row = y;
+        while (std::getline(stream, line)) {
+            move_cursor_xy(x, row);
+            std::cout << "\033[K"; // clear to end of line
+            std::cout << line;
+            ++row;
+        }
+    }
+
+    void flush() const { std::cout.flush(); }
+    void hide_cursor() const { std::cout << "\033[?25l"; }
+    void show_cursor() const { std::cout << "\033[?25h"; }
+
+    // -------------------------
+    // Drawing Primitives
+    // -------------------------
+
+    void draw_line(int x0, int y0, int x1, int y1, char ch = '*') const {
+        int dx = std::abs(x1 - x0);
+        int dy = -std::abs(y1 - y0);
+        int sx = (x0 < x1) ? 1 : -1;
+        int sy = (y0 < y1) ? 1 : -1;
+        int err = dx + dy;
+
+        while (true) {
+            move_cursor_xy(x0, y0);
+            std::cout << ch;
+            if (x0 == x1 && y0 == y1)
+                break;
+            int e2 = 2 * err;
+            if (e2 >= dy) {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    void draw_rect(int x, int y, int width, int height, char ch = '#') const {
+        for (int i = 0; i < width; ++i) {
+            move_cursor_xy(x + i, y);
+            std::cout << ch;
+            move_cursor_xy(x + i, y + height - 1);
+            std::cout << ch;
+        }
+        for (int i = 0; i < height; ++i) {
+            move_cursor_xy(x, y + i);
+            std::cout << ch;
+            move_cursor_xy(x + width - 1, y + i);
+            std::cout << ch;
+        }
+    }
+
+    void draw_circle(int cx, int cy, int r, char ch = 'o') const {
+        int x = r, y = 0;
+        int err = 0;
+        while (x >= y) {
+            plot_circle_points(cx, cy, x, y, ch);
+            ++y;
+            if (err <= 0)
+                err += 2 * y + 1;
+            if (err > 0) {
+                --x;
+                err -= 2 * x + 1;
+            }
+        }
+    }
+
+    void draw_arrow(int x0, int y0, int x1, int y1, char ch = '*') const {
+        draw_line(x0, y0, x1, y1, ch); // draw the main line
+
+        int arrow_x = x1;
+        int arrow_y = y1;
+
+        if (x0 == x1) { // vertical
+            move_cursor_xy(arrow_x, arrow_y);
+            std::cout << 'v';
+        } else if (y0 == y1) { // horizontal
+            move_cursor_xy(arrow_x, arrow_y);
+            std::cout << '>';
+        } else { // diagonal
+            move_cursor_xy(arrow_x, arrow_y);
+            std::cout << '>'; // placeholder
+        }
+    }
+
+  private:
+    void plot_circle_points(int cx, int cy, int x, int y, char ch) const {
+        move_cursor_xy(cx + x, cy + y);
+        std::cout << ch;
+        move_cursor_xy(cx - x, cy + y);
+        std::cout << ch;
+        move_cursor_xy(cx + x, cy - y);
+        std::cout << ch;
+        move_cursor_xy(cx - x, cy - y);
+        std::cout << ch;
+        move_cursor_xy(cx + y, cy + x);
+        std::cout << ch;
+        move_cursor_xy(cx - y, cy + x);
+        std::cout << ch;
+        move_cursor_xy(cx + y, cy - x);
+        std::cout << ch;
+        move_cursor_xy(cx - y, cy - x);
+        std::cout << ch;
+    }
+};
+
 int main() {
 
-    // global_logger->remove_all_sinks();
+    global_logger->remove_all_sinks();
     // global_logger->add_file_sink("logs/logs.txt");
 
     FixedFrequencyLoop ffl;
@@ -336,5 +521,19 @@ int main() {
     auto term = []() { return false; };
     ffl.logging_enabled = false;
 
-    ffl.start([&](double dt) { chord_system.key_interceptor.update(); }, term);
+    LinuxTerminalCanvas canvas;
+    canvas.hide_cursor();
+
+    ffl.start(
+        [&](double dt) {
+            chord_system.key_interceptor.update();
+            canvas.render_text_block(10, 20, input_state.get_visual_keyboard_state());
+            canvas.render_text_block(100, 20, virtual_input_state.get_visual_keyboard_state());
+            canvas.draw_arrow(71, 24, 99, 24);
+            // canvas.render_text_block(80, 25, "mapped");
+            canvas.flush();
+        },
+        term);
+
+    canvas.clear();
 }
