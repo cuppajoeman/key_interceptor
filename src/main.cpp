@@ -1,3 +1,4 @@
+#include "input/input_state/input_state.hpp"
 #include "input/linux_input_adapter/linux_input_adapter.hpp"
 
 #include "select_linux_device.hpp"
@@ -9,6 +10,7 @@
 #include "utility/logger/logger.hpp"
 #include "utility/timer/timer.hpp"
 
+#include <chrono>
 #include <iostream>
 
 InputState input_state;
@@ -46,10 +48,34 @@ class KeyInterceptor {
 
     // will make the key occur on the virtual keyboard and also go through the virtual input state for analysis
     void send_key_to_virtual_keyboard(EKey key_enum, int press_value) {
-        send_key(virtual_keyboard_file_descriptor, key_enum_to_linux_code.at(key_enum), press_value);
+
+        bool pressed = press_value > 0;
 
         Key &active_key = *(virtual_input_state.key_enum_to_object.at(key_enum));
-        active_key.pressed_signal.set(press_value > 0);
+        if (active_key.requires_modifer_to_be_typed) {
+
+            Key &active_key_unshifted =
+                *(virtual_input_state.key_enum_to_object.at(active_key.key_enum_of_unshifted_version));
+            Key &shift_key = *(virtual_input_state.key_enum_to_object.at(EKey::LEFT_SHIFT));
+            // SHIFT-KEY PRESS
+            if (pressed) {
+                send_key(virtual_keyboard_file_descriptor, key_enum_to_linux_code.at(EKey::LEFT_SHIFT), press_value);
+
+                send_key(virtual_keyboard_file_descriptor,
+                         key_enum_to_linux_code.at(active_key.key_enum_of_unshifted_version), press_value);
+
+            } else { // KEY-SHIFT RELEASE
+                send_key(virtual_keyboard_file_descriptor,
+                         key_enum_to_linux_code.at(active_key.key_enum_of_unshifted_version), press_value);
+                send_key(virtual_keyboard_file_descriptor, key_enum_to_linux_code.at(EKey::LEFT_SHIFT), press_value);
+            }
+
+            active_key_unshifted.pressed_signal.set(pressed);
+            shift_key.pressed_signal.set(pressed);
+        } else {
+            send_key(virtual_keyboard_file_descriptor, key_enum_to_linux_code.at(key_enum), press_value);
+            active_key.pressed_signal.set(pressed);
+        }
     }
 
     void update() {
@@ -90,6 +116,62 @@ class KeyInterceptor {
         keys_to_ignore_this_update.clear();
         input_state.process();
         virtual_input_state.process();
+    }
+};
+
+struct SimultaneousKeypresses {
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    KeyInterceptor &key_interceptor;
+
+    SimultaneousKeypresses(std::chrono::milliseconds t, KeyInterceptor &key_interceptor)
+        : threshold(t), key_interceptor(key_interceptor) {}
+
+    struct Combo {
+        EKey key1;
+        EKey key2;
+        std::function<void()> callback;
+    };
+
+    std::chrono::milliseconds threshold;
+    std::unordered_map<EKey, TimePoint> key_pressed_times;
+    std::vector<Combo> combos;
+
+    void register_combo(EKey key1, EKey key2, std::function<void()> callback) {
+        combos.push_back({key1, key2, callback});
+    }
+
+    // call this every update
+    void process() {
+        // record timestamps for keys that were just pressed
+        for (auto &combo : combos) {
+            for (EKey key : {combo.key1, combo.key2}) {
+                if (input_state.get_current_state(key) == TemporalBinarySwitch::State::just_switched_on) {
+                    key_pressed_times[key] = Clock::now();
+                }
+            }
+        }
+
+        // check all combos
+        for (auto &combo : combos) {
+            if (input_state.is_pressed(combo.key1) && input_state.is_pressed(combo.key2)) {
+                auto it1 = key_pressed_times.find(combo.key1);
+                auto it2 = key_pressed_times.find(combo.key2);
+
+                if (it1 != key_pressed_times.end() && it2 != key_pressed_times.end()) {
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(it2->second - it1->second);
+
+                    if (duration.count() >= 0 && duration < threshold) {
+                        combo.callback();
+
+                        // Optionally ignore keys for this update
+                        key_interceptor.keys_to_ignore_this_update.push_back(combo.key1);
+                        key_interceptor.keys_to_ignore_this_update.push_back(combo.key2);
+                    }
+                }
+            }
+        }
     }
 };
 
@@ -162,6 +244,8 @@ class ChordSystem {
         homesick,
         number_pulldown,
         programming,
+        shift_lock,
+        vim_arrows,
     };
 
     struct KeyMap {
@@ -174,15 +258,17 @@ class ChordSystem {
     KeyMap key_map;
 
     std::unordered_map<MapName, KeyMap> map_name_to_key_map = {
-        {MapName::homesick, KeyMap()},
-        {MapName::number_pulldown, KeyMap()},
-        {MapName::programming, KeyMap()},
+        {MapName::homesick, KeyMap()},   {MapName::number_pulldown, KeyMap()}, {MapName::programming, KeyMap()},
+        {MapName::shift_lock, KeyMap()}, {MapName::vim_arrows, KeyMap()},
     };
+
+    MapName current_mapping = MapName::homesick;
 
     void add_chord_mapping(EKey input_key, EKey output_key) {
         key_map.key_mappings.emplace_back(input_key, output_key);
     }
 
+    SimultaneousKeypresses simultaneous_keypresses{std::chrono::milliseconds(25), key_interceptor};
     ChordSystem() : key_interceptor([this]() { per_iteration_logic(); }) {
         // homesick
 
@@ -207,7 +293,7 @@ class ChordSystem {
         homesick_mapping.add_key_mapping(EKey::SEMICOLON, EKey::ENTER);
 
         // add_chord_mapping(EKey::n, EKey::FUNCTION_KEY);
-        homesick_mapping.add_key_mapping(EKey::m, EKey::MENU_KEY);
+        // homesick_mapping.add_key_mapping(EKey::m, EKey::MENU_KEY);
         homesick_mapping.add_key_mapping(EKey::COMMA, EKey::RIGHT_ALT);
         homesick_mapping.add_key_mapping(EKey::PERIOD, EKey::RIGHT_CONTROL);
         homesick_mapping.add_key_mapping(EKey::SLASH, EKey::RIGHT_SHIFT);
@@ -223,6 +309,10 @@ class ChordSystem {
         number_pulldown_mapping.add_key_mapping(EKey::k, EKey::EIGHT);
         number_pulldown_mapping.add_key_mapping(EKey::l, EKey::NINE);
         number_pulldown_mapping.add_key_mapping(EKey::SEMICOLON, EKey::ZERO);
+
+        // TODO: there's a problem right now when you try and send something like exclamation point because that's not a
+        // valid key in the context of the virtual keyboard instead we need to do a shift 1 or something of that form,
+        // this also has to be done when the mode is over and we're clearing stuff out.
 
         number_pulldown_mapping.add_key_mapping(EKey::q, EKey::EXCLAMATION_POINT);
         number_pulldown_mapping.add_key_mapping(EKey::w, EKey::AT_SIGN);
@@ -248,14 +338,84 @@ class ChordSystem {
 
         programming_mapping.add_key_mapping(EKey::a, EKey::LEFT_CURLY_BRACKET);          // {
         programming_mapping.add_key_mapping(EKey::SEMICOLON, EKey::RIGHT_CURLY_BRACKET); // }
-        //
-        programming_mapping.add_key_mapping(EKey::w, EKey::MINUS); // i think of this as a dash
+
+        programming_mapping.add_key_mapping(EKey::q, EKey::AMPERSAND);
+        programming_mapping.add_key_mapping(EKey::w, EKey::UNDERSCORE);
         programming_mapping.add_key_mapping(EKey::e, EKey::EQUAL);
 
-        programming_mapping.add_key_mapping(EKey::i, EKey::ASTERISK);
-        programming_mapping.add_key_mapping(EKey::o, EKey::AMPERSAND);
+        programming_mapping.add_key_mapping(EKey::u, EKey::PLUS);
+        programming_mapping.add_key_mapping(EKey::i, EKey::MINUS);
+        programming_mapping.add_key_mapping(EKey::o, EKey::ASTERISK);
+        programming_mapping.add_key_mapping(EKey::p, EKey::SLASH);
 
         programming_mapping.add_key_mapping(EKey::x, EKey::COLON);
+
+        auto &vim_arrows = map_name_to_key_map.at(MapName::vim_arrows);
+        vim_arrows.add_key_mapping(EKey::h, EKey::LEFT);
+        vim_arrows.add_key_mapping(EKey::l, EKey::RIGHT);
+        vim_arrows.add_key_mapping(EKey::j, EKey::DOWN);
+        vim_arrows.add_key_mapping(EKey::k, EKey::UP);
+
+        auto &shift_lock = map_name_to_key_map.at(MapName::shift_lock);
+
+        for (auto &key : input_state.all_keys) {
+            if (key.shiftable) {
+                shift_lock.add_key_mapping(key.key_enum, key.key_enum_of_shifted_version);
+            }
+        }
+
+        if (not space_tap_mapping_activation_mode) {
+
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::f, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::homesick;
+                key_used_to_start_mapping = EKey::f;
+            });
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::j, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::homesick;
+                key_used_to_start_mapping = EKey::j;
+            });
+
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::d, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::number_pulldown;
+                key_used_to_start_mapping = EKey::d;
+            });
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::k, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::number_pulldown;
+                key_used_to_start_mapping = EKey::k;
+            });
+
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::s, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::programming;
+                key_used_to_start_mapping = EKey::s;
+            });
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::l, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::programming;
+                key_used_to_start_mapping = EKey::l;
+            });
+
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::v, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::vim_arrows;
+                key_used_to_start_mapping = EKey::v;
+            });
+
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::z, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::shift_lock;
+                key_used_to_start_mapping = EKey::z;
+            });
+            simultaneous_keypresses.register_combo(EKey::SPACE, EKey::SLASH, [&]() {
+                mapping_mode_active = true;
+                current_mapping = MapName::shift_lock;
+                key_used_to_start_mapping = EKey::SLASH;
+            });
+        }
     }
 
     KeyInterceptor key_interceptor;
@@ -264,95 +424,139 @@ class ChordSystem {
     Timer mapping_mode_activation_timer{0.2};
 
     bool mapping_mode_active = false;
+    EKey key_used_to_start_mapping;
 
     bool possibly_going_into_mapping_mode = false;
 
     bool logging_enabled = false;
 
+    bool space_tap_mapping_activation_mode = false;
+
+    std::chrono::steady_clock::time_point space_pressed_time;
+    std::chrono::steady_clock::time_point f_pressed_time;
+
     void per_iteration_logic() {
 
         GlobalLogSection _("tick", logging_enabled);
 
-        global_logger->debug("space signal state: {}",
-                             input_state.key_enum_to_object.at(EKey::SPACE)->pressed_signal.to_string());
+        if (space_tap_mapping_activation_mode) {
+            global_logger->debug("space signal state: {}",
+                                 input_state.key_enum_to_object.at(EKey::SPACE)->pressed_signal.to_string());
 
-        if (input_state.is_just_pressed(EKey::SPACE)) {
-            if (mapping_mode_activation_timer.time_up() or not timer_started_at_least_once) {
+            if (input_state.is_just_pressed(EKey::SPACE)) {
+                if (mapping_mode_activation_timer.time_up() or not timer_started_at_least_once) {
+                    mapping_mode_active = false;
+                    mapping_mode_activation_timer.start();
+                    possibly_going_into_mapping_mode = true;
+                    timer_started_at_least_once = true;
+                } else { // the timer was not up
+                    mapping_mode_active = true;
+                    global_logger->debug("chord started");
+                }
+                // If you manually press space, it gets ignored
+                key_interceptor.keys_to_ignore_this_update.push_back(EKey::SPACE);
+            }
+
+            // only if the time for the chord to start elapsed and you had pressed space we do a slightly delayed space
+            // emission
+            if (not mapping_mode_active and mapping_mode_activation_timer.time_up() and
+                possibly_going_into_mapping_mode) {
+                key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
+                key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
+                // you took too long so we're longer trying to
+                possibly_going_into_mapping_mode = false;
+            }
+
+            // TODO: this doesn't work because it needs to not be reset per iteration because it doesn't have any effect
+            // because it cannot effect more than one iteration and chord keys come through on different iterations
+            int num_consecutive_keys_to_modify = 1;
+
+            // chord ends here
+            if (input_state.is_just_released(EKey::SPACE) and mapping_mode_active) {
                 mapping_mode_active = false;
-                mapping_mode_activation_timer.start();
-                possibly_going_into_mapping_mode = true;
-                timer_started_at_least_once = true;
-            } else { // the timer was not up
-                mapping_mode_active = true;
-                global_logger->debug("chord started");
+                // turn off all possible output keys from the chord mapping so they don't repeat if they were held down
+                // when space was released.
+                for (auto &km : map_name_to_key_map.at(MapName::homesick).key_mappings) {
+
+                    // leave actively pressed keys on.
+                    if (input_state.is_pressed(km.input_key))
+                        continue;
+
+                    // release all other keys
+                    km.active = false;
+
+                    global_logger->info("about to turn off key: {}",
+                                        input_state.key_enum_to_object.at(km.input_key)->string_repr);
+
+                    key_interceptor.send_key_to_virtual_keyboard(km.output_key, LinuxInputAdapter::release_value);
+                }
             }
-            // If you manually press space, it gets ignored
-            key_interceptor.keys_to_ignore_this_update.push_back(EKey::SPACE);
-        }
 
-        // only if the time for the chord to start elapsed and you had pressed space we do a slightly delayed space
-        // emission
-        if (not mapping_mode_active and mapping_mode_activation_timer.time_up() and possibly_going_into_mapping_mode) {
-            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
-            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
-            // you took too long so we're longer trying to
-            possibly_going_into_mapping_mode = false;
-        }
-
-        // TODO: this doesn't work because it needs to not be reset per iteration because it doesn't have any effect
-        // because it cannot effect more than one iteration and chord keys come through on different iterations
-        int num_consecutive_keys_to_modify = 1;
-
-        // chord ends here
-        if (input_state.is_just_released(EKey::SPACE) and mapping_mode_active) {
-            mapping_mode_active = false;
-            // turn off all possible output keys from the chord mapping so they don't repeat if they were held down
-            // when space was released.
-            for (auto &km : map_name_to_key_map.at(MapName::homesick).key_mappings) {
-
-                // leave actively pressed keys on.
-                if (input_state.is_pressed(km.input_key))
-                    continue;
-
-                // release all other keys
-                km.active = false;
-
-                global_logger->info("about to turn off key: {}",
-                                    input_state.key_enum_to_object.at(km.input_key)->string_repr);
-
-                key_interceptor.send_key_to_virtual_keyboard(km.output_key, LinuxInputAdapter::release_value);
+            auto just_pressed_keys = input_state.get_just_pressed_keys();
+            bool used_non_space_key =
+                not collection_utils::contains(just_pressed_keys, EKey::SPACE) and not just_pressed_keys.empty();
+            // when you type somethign like  "<space>a" we immediately emit the space key before this key so that you
+            // can type at full speed.
+            if (not mapping_mode_active and used_non_space_key and possibly_going_into_mapping_mode) {
+                key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
+                key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
+                possibly_going_into_mapping_mode = false;
             }
-        }
 
-        auto just_pressed_keys = input_state.get_just_pressed_keys();
-        bool used_non_space_key =
-            not collection_utils::contains(just_pressed_keys, EKey::SPACE) and not just_pressed_keys.empty();
-        // when you type somethign like  "<space>a" we immediately emit the space key before this key so that you can
-        // type at full speed.
-        if (not mapping_mode_active and used_non_space_key and possibly_going_into_mapping_mode) {
-            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::press_value);
-            key_interceptor.send_key_to_virtual_keyboard(EKey::SPACE, LinuxInputAdapter::release_value);
-            possibly_going_into_mapping_mode = false;
+        } else {
+
+            simultaneous_keypresses.process();
+
+            // when you do space-f and then let go of f we still want to ignore space
+            if (mapping_mode_active) {
+                if (input_state.is_pressed(EKey::SPACE)) {
+                    key_interceptor.keys_to_ignore_this_update.push_back(EKey::SPACE);
+                }
+            }
+
+            if (input_state.is_just_released(EKey::SPACE) and mapping_mode_active) {
+                mapping_mode_active = false;
+                // turn off all possible output keys from the chord mapping so they don't repeat if they were held down
+                // when space was released.
+                for (auto &km : map_name_to_key_map.at(current_mapping).key_mappings) {
+
+                    // leave actively pressed keys on.
+                    if (input_state.is_pressed(km.input_key))
+                        continue;
+
+                    // release all other keys
+                    km.active = false;
+
+                    global_logger->info("about to turn off key: {}",
+                                        input_state.key_enum_to_object.at(km.input_key)->string_repr);
+
+                    // std::cout << "about to turn off key: {}"
+                    //           << input_state.key_enum_to_object.at(km.input_key)->string_repr << std::endl;
+
+                    key_interceptor.send_key_to_virtual_keyboard(km.output_key, LinuxInputAdapter::release_value);
+                }
+            }
         }
 
         // TODO: generalize with more stuff later
         if (mapping_mode_active) {
-            for (auto &cm : map_name_to_key_map.at(MapName::homesick).key_mappings) {
+            for (auto &cm : map_name_to_key_map.at(current_mapping).key_mappings) {
                 cm.active = true;
                 // transform_input_key_to_output_key(cm.input_key, cm.output_key);
             }
         }
 
         // this does the mappings
-        for (auto &cm : map_name_to_key_map.at(MapName::homesick).key_mappings) {
+        for (auto &cm : map_name_to_key_map.at(current_mapping).key_mappings) {
 
-            if (not cm.active)
+            // if you do space-f then don't run the f function
+            if (not cm.active or cm.input_key == key_used_to_start_mapping)
                 continue;
 
             int value;
             switch (input_state.get_current_state(cm.input_key)) {
             case TemporalBinarySwitch::State::just_switched_on:
-                possibly_going_into_mapping_mode = false; // WTF WHAT IS THAT
+                possibly_going_into_mapping_mode = false;
                 value = LinuxInputAdapter::press_value;
                 break;
             case TemporalBinarySwitch::State::sustained_on:
@@ -527,9 +731,10 @@ int main() {
     ffl.start(
         [&](double dt) {
             chord_system.key_interceptor.update();
-            canvas.render_text_block(10, 20, input_state.get_visual_keyboard_state());
-            canvas.render_text_block(100, 20, virtual_input_state.get_visual_keyboard_state());
-            canvas.draw_arrow(71, 24, 99, 24);
+            canvas.render_text_block(0, 0, chord_system.mapping_mode_active ? "mapping" : "not mapping");
+            canvas.render_text_block(10, 4, input_state.get_visual_keyboard_state());
+            canvas.render_text_block(100, 4, virtual_input_state.get_visual_keyboard_state());
+            canvas.draw_arrow(71, 8, 99, 8);
             // canvas.render_text_block(80, 25, "mapped");
             canvas.flush();
         },
