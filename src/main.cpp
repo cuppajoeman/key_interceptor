@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <ratio>
 
 InputState input_state;
 InputState virtual_input_state;
@@ -138,6 +139,8 @@ struct SimultaneousKeypresses {
     std::unordered_map<EKey, TimePoint> key_pressed_times;
     std::vector<Combo> combos;
 
+    std::chrono::milliseconds last_duration;
+
     void register_combo(EKey key1, EKey key2, std::function<void()> callback) {
         combos.push_back({key1, key2, callback});
     }
@@ -161,8 +164,10 @@ struct SimultaneousKeypresses {
 
                 if (it1 != key_pressed_times.end() && it2 != key_pressed_times.end()) {
                     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(it2->second - it1->second);
+                    auto abs_duration = std::chrono::milliseconds(std::abs(duration.count()));
+                    last_duration = abs_duration;
 
-                    if (duration.count() >= 0 && duration < threshold) {
+                    if (abs_duration.count() >= 0 && abs_duration < threshold) {
                         combo.callback();
 
                         // Optionally ignore keys for this update
@@ -268,7 +273,7 @@ class ChordSystem {
         key_map.key_mappings.emplace_back(input_key, output_key);
     }
 
-    SimultaneousKeypresses simultaneous_keypresses{std::chrono::milliseconds(25), key_interceptor};
+    SimultaneousKeypresses simultaneous_keypresses{std::chrono::milliseconds(35), key_interceptor};
     ChordSystem() : key_interceptor([this]() { per_iteration_logic(); }) {
         // homesick
 
@@ -732,6 +737,7 @@ int main() {
         [&](double dt) {
             chord_system.key_interceptor.update();
             canvas.render_text_block(0, 0, chord_system.mapping_mode_active ? "mapping" : "not mapping");
+            canvas.render_text_block(0, 20, std::to_string(chord_system.simultaneous_keypresses.last_duration.count()));
             canvas.render_text_block(10, 4, input_state.get_visual_keyboard_state());
             canvas.render_text_block(100, 4, virtual_input_state.get_visual_keyboard_state());
             canvas.draw_arrow(71, 8, 99, 8);
