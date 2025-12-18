@@ -4,6 +4,8 @@ It does this by creating a virtual keyboard, and ignoring the real keyboard, and
 
 As of right now it only works on linux.
 
+the current state of this project is that the idea is right but the way the mappings are enabled needs work
+
 # mappings
 
 ## empty
